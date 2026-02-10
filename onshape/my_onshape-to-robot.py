@@ -596,14 +596,19 @@ def main():
 
     base_url = os.getenv("ONSHAPE_API", "https://cad.onshape.com")
 
-    # URL from CLI argument or config.json fallback
+    # URL from CLI argument, ENV file, or config.json fallback
     url = None
     if len(sys.argv) > 1:
         url = sys.argv[1]
-    else:
+    
+    if not url:
+        # Check the .env file for ONSHAPE_URL
+        url = os.getenv("ONSHAPE_URL")
+
+    if not url:
+        # Fallback to config.json
         cfg_path = here / "my-robot" / "config.json"
         if cfg_path.exists():
-            # Strip // comments (only full-line comments, to avoid breaking URLs)
             raw_lines = cfg_path.read_text(encoding="utf-8").splitlines()
             cleaned = [ln for ln in raw_lines if not re.match(r"^\s*//", ln)]
             cfg = json.loads("\n".join(cleaned))

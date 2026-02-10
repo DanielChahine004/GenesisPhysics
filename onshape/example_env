@@ -1,0 +1,5 @@
+# .env
+# Obtained at https://dev-portal.onshape.com/keys
+ONSHAPE_API=https://cad.onshape.com
+ONSHAPE_ACCESS_KEY=
+ONSHAPE_SECRET_KEY=

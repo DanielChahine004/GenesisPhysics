@@ -40,6 +40,8 @@ from urllib.parse import urlencode, urlparse
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
 
+import struct
+
 import numpy as np
 import requests
 from dotenv import load_dotenv
@@ -184,6 +186,105 @@ def _fmt(vals, prec: int = 8) -> str:
 #  Onshape mate-type → URDF joint-type mapping
 # ═══════════════════════════════════════════════════════════════════════════
 
+def compute_mesh_mass_props(stl_path: Path, density: float = 1000.0) -> dict:
+    """Compute mass, COM, and inertia tensor from a binary STL assuming uniform density.
+
+    Uses the divergence-theorem method: each triangle + the origin forms a signed
+    tetrahedron.  Summing these gives volume, centroid, and the inertia tensor of
+    the enclosed solid.
+    """
+    data = stl_path.read_bytes()
+    if len(data) < 84:
+        return {"mass": 1.0, "com": np.zeros(3), "inertia": np.eye(3) * 0.001}
+
+    n_tri = struct.unpack_from("<I", data, 80)[0]
+
+    # Accumulate signed-volume integrals
+    vol6 = 0.0          # 6 × signed volume
+    cx24 = cy24 = cz24 = 0.0   # 24 × V × centroid components
+
+    # For inertia we accumulate the canonical integrals a, b, c, aa, bb, cc, ab, ac, bc
+    # over the tetrahedra (Mirtich / Eberly formulas, simplified for origin-based tets)
+    Ixx = Iyy = Izz = Ixy = Ixz = Iyz = 0.0
+
+    for i in range(n_tri):
+        off = 84 + i * 50
+        # skip normal (12 bytes), read 3 vertices as float32
+        v0 = struct.unpack_from("<3f", data, off + 12)
+        v1 = struct.unpack_from("<3f", data, off + 24)
+        v2 = struct.unpack_from("<3f", data, off + 36)
+
+        # Signed volume of tetrahedron (origin, v0, v1, v2) = det / 6
+        det = (v0[0] * (v1[1] * v2[2] - v1[2] * v2[1])
+             - v0[1] * (v1[0] * v2[2] - v1[2] * v2[0])
+             + v0[2] * (v1[0] * v2[1] - v1[1] * v2[0]))
+
+        vol6 += det
+
+        # Centroid of tetrahedron = (v0+v1+v2) / 4   (origin is at 0)
+        # Integral contribution: det * (v0+v1+v2) / 24V  summed → divide at end
+        cx24 += det * (v0[0] + v1[0] + v2[0])
+        cy24 += det * (v0[1] + v1[1] + v2[1])
+        cz24 += det * (v0[2] + v1[2] + v2[2])
+
+        # Inertia integrals (about origin) for uniform-density tetrahedron
+        # Using the canonical tetrahedron inertia formulas:
+        for a, b, c in ((v0, v1, v2),):
+            # Second-order terms
+            x2 = (a[0]*a[0] + a[0]*b[0] + b[0]*b[0]
+                 + (a[0]+b[0])*c[0] + c[0]*c[0])
+            y2 = (a[1]*a[1] + a[1]*b[1] + b[1]*b[1]
+                 + (a[1]+b[1])*c[1] + c[1]*c[1])
+            z2 = (a[2]*a[2] + a[2]*b[2] + b[2]*b[2]
+                 + (a[2]+b[2])*c[2] + c[2]*c[2])
+
+            xy = (2*a[0]*a[1] + a[0]*b[1] + a[0]*c[1]
+                 + b[0]*a[1] + 2*b[0]*b[1] + b[0]*c[1]
+                 + c[0]*a[1] + c[0]*b[1] + 2*c[0]*c[1])
+            xz = (2*a[0]*a[2] + a[0]*b[2] + a[0]*c[2]
+                 + b[0]*a[2] + 2*b[0]*b[2] + b[0]*c[2]
+                 + c[0]*a[2] + c[0]*b[2] + 2*c[0]*c[2])
+            yz = (2*a[1]*a[2] + a[1]*b[2] + a[1]*c[2]
+                 + b[1]*a[2] + 2*b[1]*b[2] + b[1]*c[2]
+                 + c[1]*a[2] + c[1]*b[2] + 2*c[1]*c[2])
+
+            Ixx += det * (y2 + z2)
+            Iyy += det * (x2 + z2)
+            Izz += det * (x2 + y2)
+            Ixy -= det * xy
+            Ixz -= det * xz
+            Iyz -= det * yz
+
+    volume = abs(vol6 / 6.0)
+    if volume < 1e-15:
+        return {"mass": 1.0, "com": np.zeros(3), "inertia": np.eye(3) * 0.001}
+
+    com = np.array([cx24, cy24, cz24]) / (4.0 * vol6)
+    mass = volume * density
+
+    # Scale inertia integrals (different factors for squared vs cross terms):
+    #   ∫x² dV = det/60 * (terms)  →  diagonal uses density/60
+    #   ∫xy dV = det/120 * (terms) →  off-diagonal uses density/120
+    fd = density / 60.0      # diagonal (squared terms)
+    fc = density / 120.0     # off-diagonal (cross terms)
+    I_origin = np.array([
+        [ Ixx * fd,  Ixy * fc,  Ixz * fc],
+        [ Ixy * fc,  Iyy * fd,  Iyz * fc],
+        [ Ixz * fc,  Iyz * fc,  Izz * fd],
+    ])
+
+    # Shift to centroid using parallel-axis theorem:  I_com = I_origin - m*(c·c I - c⊗c)
+    c = com
+    I_com = I_origin - mass * (np.dot(c, c) * np.eye(3) - np.outer(c, c))
+
+    # Ensure positive diagonal (numerical safety)
+    for k in range(3):
+        if I_com[k, k] < 1e-12:
+            I_com[k, k] = 1e-6
+
+    return {"mass": mass, "com": com, "inertia": I_com}
+
+
 MATE_TO_URDF = {
     "FASTENED":    "fixed",
     "REVOLUTE":    "revolute",
@@ -213,6 +314,7 @@ class OnshapeToURDF:
         self.parts: dict[str, dict] = {}      # instance_id → part info
         self.mates: list[dict] = []           # mate features
         self.link_frames: dict[str, np.ndarray] = {}  # instance_id → global 4x4
+        self._mass_cache: dict[str, dict] = {}  # (did, eid) → raw API response
 
     # ─── API calls ────────────────────────────────────────────────────────
 
@@ -253,6 +355,114 @@ class OnshapeToURDF:
 
         stl_path.write_bytes(resp.content)
         return stl_path
+
+    DEFAULT_DENSITY = 1000.0  # kg/m³ — fallback when no material is assigned
+
+    @staticmethod
+    def _default_mass_props() -> dict:
+        return {"mass": 1.0, "com": np.zeros(3), "inertia": np.eye(3) * 0.001}
+
+    def _fetch_part_studio_mass_props(self, did: str, eid: str) -> dict:
+        """Fetch (and cache) mass properties for an entire part studio."""
+        cache_key = f"{did}:{eid}"
+        if cache_key in self._mass_cache:
+            return self._mass_cache[cache_key]
+
+        path = f"/api/partstudios/d/{did}/{self.wvm}/{self.wvmid}/e/{eid}/massproperties"
+        try:
+            # massAsGroup=false → individual bodies keyed by partId
+            resp = self.client.get(path, {"massAsGroup": "false"}).json()
+        except Exception as e:
+            log.warning("  Mass-props API failed for eid=%s: %s", eid, e)
+            resp = {}
+
+        self._mass_cache[cache_key] = resp
+        bodies = resp.get("bodies", {})
+        log.info("  Mass-props response: %d bodies, keys=%s",
+                 len(bodies), list(bodies.keys()))
+        return resp
+
+    @staticmethod
+    def _parse_body_mass_props(body: dict) -> dict:
+        """Parse a single body entry from the mass-properties response."""
+        # mass: Onshape returns [value] list
+        raw_mass = body.get("mass")
+        if isinstance(raw_mass, list) and raw_mass:
+            mass = float(raw_mass[0])
+        elif raw_mass is not None:
+            mass = float(raw_mass)
+        else:
+            mass = 0.0
+
+        # volume: used to estimate mass when material isn't set (mass=0)
+        raw_vol = body.get("volume")
+        if isinstance(raw_vol, list) and raw_vol:
+            volume = float(raw_vol[0])
+        elif raw_vol is not None:
+            volume = float(raw_vol)
+        else:
+            volume = 0.0
+
+        # centroid: [x, y, z] in part-studio coordinates (meters)
+        raw_com = body.get("centroid")
+        if raw_com and len(raw_com) >= 3:
+            com = np.array(raw_com[:3], dtype=float)
+        else:
+            com = np.zeros(3)
+
+        # inertia tensor about centroid in part-studio frame
+        # Onshape returns [Ixx, Ixy, Ixz, Iyx, Iyy, Iyz, Izx, Izy, Izz]
+        raw_inertia = body.get("inertia")
+        if raw_inertia and len(raw_inertia) >= 9:
+            inertia = np.array(raw_inertia[:9], dtype=float).reshape(3, 3)
+        else:
+            inertia = np.eye(3) * 0.001
+
+        return {"mass": mass, "volume": volume, "com": com, "inertia": inertia}
+
+    def _get_mass_properties(self, part: dict) -> dict:
+        """Fetch real mass, center-of-mass, and inertia tensor from Onshape."""
+        did = part.get("documentId", self.did)
+        eid = part["elementId"]
+        pid = part["partId"]
+
+        log.info("  Fetching mass properties for %s (partId=%s) ...", part["link"], pid)
+
+        resp = self._fetch_part_studio_mass_props(did, eid)
+        bodies = resp.get("bodies", {})
+
+        # Look up this specific part
+        body = bodies.get(pid)
+        if body is None:
+            # Log available keys for debugging
+            log.warning("  partId '%s' not in bodies (keys: %s)", pid, list(bodies.keys()))
+            return self._default_mass_props()
+
+        props = self._parse_body_mass_props(body)
+
+        # When no material is assigned, Onshape returns mass=0 and centroid=[0,0,0].
+        # Fall back to computing mass properties from the STL mesh geometry.
+        no_material = props["mass"] < 1e-12 or np.allclose(props["com"], 0)
+        if no_material:
+            stl_path = self.meshes / f"{part['link']}.stl"
+            if stl_path.exists():
+                log.warning("    No material in Onshape — computing from STL mesh (%s)",
+                            stl_path.name)
+                props = compute_mesh_mass_props(stl_path, self.DEFAULT_DENSITY)
+            elif props["mass"] < 1e-12 and props["volume"] > 0:
+                props["mass"] = props["volume"] * self.DEFAULT_DENSITY
+                log.warning("    No material — estimated mass=%.6f kg from API volume",
+                            props["mass"])
+            else:
+                props["mass"] = 1.0
+                log.warning("    No mass data available — using fallback mass=1.0 kg")
+
+        log.info("    mass=%.6f kg  com=[%.6f, %.6f, %.6f]",
+                 props["mass"], *props["com"])
+        log.info("    Ixx=%.6g  Iyy=%.6g  Izz=%.6g",
+                 props["inertia"][0, 0], props["inertia"][1, 1], props["inertia"][2, 2])
+
+        return props
 
     # ─── Assembly parsing ─────────────────────────────────────────────────
 
@@ -338,6 +548,12 @@ class OnshapeToURDF:
                             fd.get("name"))
                 continue
 
+            # Extract mate limits if present (Onshape returns these when user
+            # has configured limits on the mate in the assembly)
+            mate_limits = None
+            if "limits" in fd:
+                mate_limits = fd["limits"]
+
             self.mates.append({
                 "name": self._sanitize_name(fd.get("name", feat["id"])),
                 "type": fd.get("mateType", "FASTENED"),
@@ -345,6 +561,7 @@ class OnshapeToURDF:
                 "cid": cid,
                 "pCS": entities[0].get("matedCS", {}),
                 "cCS": entities[1].get("matedCS", {}),
+                "limits": mate_limits,
             })
 
         log.info("Found %d parts, %d mates", len(self.parts), len(self.mates))
@@ -425,26 +642,39 @@ class OnshapeToURDF:
     # ─── URDF XML builders ────────────────────────────────────────────────
 
     @staticmethod
-    def _xml_link(name: str, stl_filename: str, mesh_origin: np.ndarray) -> ET.Element:
-        """Create a <link> with visual, collision, and placeholder inertial."""
+    def _xml_link(name: str, stl_filename: str, mesh_origin: np.ndarray, mass_props: dict) -> ET.Element:
         link = ET.Element("link", name=name)
+
+        # mesh_origin transforms part-studio coords → link-frame coords
         xyz, rpy = T_to_xyz_rpy(mesh_origin)
+        R = mesh_origin[:3, :3]
 
-        # Inertial (placeholder values — replace with real mass properties)
+        # COM: transform from part-studio frame to link frame
+        com_ps = mass_props["com"]           # in part-studio coords
+        com_link = R @ com_ps + mesh_origin[:3, 3]  # in link-frame coords
+
+        # Inertia tensor: rotate from part-studio frame to link frame
+        #   I_link = R · I_ps · Rᵀ   (about the centroid)
+        I_ps = mass_props["inertia"]
+        I_link = R @ I_ps @ R.T
+
+        # 1. Inertial — origin xyz is the COM in link frame, rpy="0 0 0"
+        #    because the inertia tensor is already expressed in the link frame.
         inertial = ET.SubElement(link, "inertial")
-        ET.SubElement(inertial, "origin", xyz=_fmt(xyz), rpy=_fmt(rpy))
-        ET.SubElement(inertial, "mass", value="1.0")
+        ET.SubElement(inertial, "origin", xyz=_fmt(com_link), rpy="0 0 0")
+        ET.SubElement(inertial, "mass", value=_fmt(mass_props["mass"]))
         ET.SubElement(inertial, "inertia",
-                      ixx="0.001", ixy="0", ixz="0",
-                      iyy="0.001", iyz="0", izz="0.001")
+                      ixx=_fmt(I_link[0, 0]), ixy=_fmt(I_link[0, 1]),
+                      ixz=_fmt(I_link[0, 2]), iyy=_fmt(I_link[1, 1]),
+                      iyz=_fmt(I_link[1, 2]), izz=_fmt(I_link[2, 2]))
 
-        # Visual
+        # 2. Visual
         visual = ET.SubElement(link, "visual")
         ET.SubElement(visual, "origin", xyz=_fmt(xyz), rpy=_fmt(rpy))
         geom_v = ET.SubElement(visual, "geometry")
         ET.SubElement(geom_v, "mesh", filename=f"meshes/{stl_filename}")
 
-        # Collision (same mesh)
+        # 3. Collision
         collision = ET.SubElement(link, "collision")
         ET.SubElement(collision, "origin", xyz=_fmt(xyz), rpy=_fmt(rpy))
         geom_c = ET.SubElement(collision, "geometry")
@@ -455,7 +685,8 @@ class OnshapeToURDF:
     @staticmethod
     def _xml_joint(name: str, jtype: str,
                    parent_link: str, child_link: str,
-                   origin_T: np.ndarray) -> ET.Element:
+                   origin_T: np.ndarray,
+                   limits: dict | None = None) -> ET.Element:
         """Create a <joint> element with axis and limits."""
         joint = ET.Element("joint", name=name, type=jtype)
         xyz, rpy = T_to_xyz_rpy(origin_T)
@@ -466,14 +697,19 @@ class OnshapeToURDF:
 
         if jtype == "revolute":
             ET.SubElement(joint, "axis", xyz="0 0 1")
+            # Use Onshape limits if available, else default ±π
+            lo = str(limits.get("minimum", -3.14159)) if limits else "-3.14159"
+            hi = str(limits.get("maximum",  3.14159)) if limits else "3.14159"
             ET.SubElement(joint, "limit",
                           effort="100", velocity="3.14159",
-                          lower="-3.14159", upper="3.14159")
+                          lower=lo, upper=hi)
         elif jtype == "prismatic":
             ET.SubElement(joint, "axis", xyz="0 0 1")
+            lo = str(limits.get("minimum", -1.0)) if limits else "-1.0"
+            hi = str(limits.get("maximum",  1.0)) if limits else "1.0"
             ET.SubElement(joint, "limit",
                           effort="100", velocity="1.0",
-                          lower="-1.0", upper="1.0")
+                          lower=lo, upper=hi)
         elif jtype == "continuous":
             ET.SubElement(joint, "axis", xyz="0 0 1")
         # 'fixed' joints need no axis or limits
@@ -537,9 +773,10 @@ class OnshapeToURDF:
 
         # Root link
         root_part = self.parts[root_id]
+        root_mass = self._get_mass_properties(root_part) # New
         root_mesh_T = np.linalg.inv(self.link_frames[root_id]) @ root_part["T"]
         robot.append(self._xml_link(
-            root_part["link"], f"{root_part['link']}.stl", root_mesh_T,
+            root_part["link"], f"{root_part['link']}.stl", root_mesh_T, root_mass
         ))
 
         # Joints + child links (in BFS order)
@@ -547,8 +784,10 @@ class OnshapeToURDF:
             parent_part = self.parts[parent_id]
             child_part = self.parts[child_id]
 
-            # Joint type
+            # Joint type — revolute mates without limits become continuous
             jtype = MATE_TO_URDF.get(mate["type"], "fixed")
+            if mate["type"] in ("REVOLUTE", "CYLINDRICAL", "PIN_SLOT") and not mate.get("limits"):
+                jtype = "continuous"
 
             # Joint origin = transform from parent link frame → child link frame
             joint_T = np.linalg.inv(self.link_frames[parent_id]) @ self.link_frames[child_id]
@@ -556,15 +795,19 @@ class OnshapeToURDF:
             # Child mesh origin = transform from child link frame → occurrence frame
             child_mesh_T = np.linalg.inv(self.link_frames[child_id]) @ child_part["T"]
 
+            child_mass = self._get_mass_properties(child_part) # New
+            
             robot.append(self._xml_joint(
                 mate["name"], jtype,
                 parent_part["link"], child_part["link"],
                 joint_T,
+                limits=mate.get("limits"),
             ))
+            
             robot.append(self._xml_link(
-                child_part["link"], f"{child_part['link']}.stl", child_mesh_T,
+                child_part["link"], f"{child_part['link']}.stl", child_mesh_T, child_mass
             ))
-
+            
         # ── Step 7: Write URDF file ──────────────────────────────────────
         urdf_path = self.out / "robot.urdf"
         raw_xml = ET.tostring(robot, encoding="unicode")

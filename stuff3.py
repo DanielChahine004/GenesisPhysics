@@ -16,13 +16,16 @@ robot = scene.add_entity(
 
 scene.build()
 
-# 1. Initialize Controller Gains
-robot.set_dofs_kp([1000.0] * robot.n_dofs) 
-robot.set_dofs_kv([50.0] * robot.n_dofs)  
+# Higher Kp for "stiffness", Kv for "smoothness"
+kp_value = 400.0 
+kv_value = 100.0  
 
-# 2. Control state
+robot.set_dofs_kp([kp_value] * robot.n_dofs)
+robot.set_dofs_kv([kv_value] * robot.n_dofs)
+
+# Much smaller increment for human-controllable speed
 target_pos = 0.0
-increment = 0.01 
+increment = 0.002  # Roughly 0.1 radians per second at 60Hz
 
 print("--- Control Guide ---")
 print("Hold 'UP arrow'   : Increase position")

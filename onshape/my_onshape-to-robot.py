@@ -328,6 +328,13 @@ class OnshapeToURDF:
             "includeMateConnectors": "true",
         }).json()
 
+    def _fetch_assembly_features(self) -> dict:
+        """GET full assembly features (includes mate limit parameters)."""
+        log.info("Fetching assembly features (for mate limits) ...")
+        path = (f"/api/assemblies/d/{self.did}"
+                f"/{self.wvm}/{self.wvmid}/e/{self.eid}/features")
+        return self.client.get(path).json()
+
     def _download_stl(self, part: dict) -> Path:
         """Download the STL mesh for a single part from its part studio."""
         stl_path = self.meshes / f"{part['link']}.stl"
@@ -470,9 +477,83 @@ class OnshapeToURDF:
         """Convert an Onshape name to a valid URDF identifier."""
         return re.sub(r"[^a-zA-Z0-9]+", "_", raw).strip("_").lower()
 
-    def _parse(self, data: dict):
+    @staticmethod
+    def _parse_feature_limits(features_data: dict) -> dict[str, dict]:
+        """Extract mate limits from the assembly features response.
+
+        Returns {featureId: {"min": radians, "max": radians}} for mates
+        that have limitsEnabled=true and actual Z-axis rotation limits set.
+        """
+        limits_map: dict[str, dict] = {}
+
+        for feat in features_data.get("features", []):
+            msg = feat.get("message", {})
+            fid = msg.get("featureId")
+            if not fid:
+                continue
+
+            # Index parameters by parameterId for easy lookup
+            params: dict[str, dict] = {}
+            for p in msg.get("parameters", []):
+                pm = p.get("message", {})
+                pid = pm.get("parameterId")
+                if pid:
+                    params[pid] = pm
+
+            # Check if limits are enabled
+            limits_enabled = params.get("limitsEnabled", {})
+            if not limits_enabled.get("value", False):
+                continue
+
+            # For revolute mates the rotation limits are on the Z axis:
+            #   limitAxialZMin, limitAxialZMax
+            # A limit is "set" when nullValue == "" (not "No minimum" / "No maximum")
+            zmin_p = params.get("limitAxialZMin", {})
+            zmax_p = params.get("limitAxialZMax", {})
+
+            has_min = not zmin_p.get("isNull", True) and zmin_p.get("nullValue", "x") == ""
+            has_max = not zmax_p.get("isNull", True) and zmax_p.get("nullValue", "x") == ""
+
+            if not has_min and not has_max:
+                continue
+
+            def _parse_expr(expr: str) -> float | None:
+                """Parse an Onshape expression like '240 deg' or '1.5 rad' to radians."""
+                if not expr:
+                    return None
+                expr = expr.strip()
+                if expr.endswith("deg"):
+                    return math.radians(float(expr.replace("deg", "").strip()))
+                elif expr.endswith("rad"):
+                    return float(expr.replace("rad", "").strip())
+                else:
+                    # Assume radians if no unit
+                    try:
+                        return float(expr)
+                    except ValueError:
+                        return None
+
+            limit = {}
+            if has_min:
+                val = _parse_expr(zmin_p.get("expression", ""))
+                if val is not None:
+                    limit["min"] = val
+            if has_max:
+                val = _parse_expr(zmax_p.get("expression", ""))
+                if val is not None:
+                    limit["max"] = val
+
+            if limit:
+                limits_map[fid] = limit
+
+        return limits_map
+
+    def _parse(self, data: dict, features_data: dict | None = None):
         """Parse the raw assembly JSON into self.parts and self.mates."""
         root = data["rootAssembly"]
+
+        # Build featureId → limits mapping from assembly features endpoint
+        limits_map = self._parse_feature_limits(features_data) if features_data else {}
 
         # 1) Occurrence transforms  (keyed by path-tuple)
         occ_T: dict[tuple, np.ndarray] = {}
@@ -548,11 +629,8 @@ class OnshapeToURDF:
                             fd.get("name"))
                 continue
 
-            # Extract mate limits if present (Onshape returns these when user
-            # has configured limits on the mate in the assembly)
-            mate_limits = None
-            if "limits" in fd:
-                mate_limits = fd["limits"]
+            # Look up limits from the assembly features endpoint
+            mate_limits = limits_map.get(feat["id"])
 
             self.mates.append({
                 "name": self._sanitize_name(fd.get("name", feat["id"])),
@@ -697,16 +775,15 @@ class OnshapeToURDF:
 
         if jtype == "revolute":
             ET.SubElement(joint, "axis", xyz="0 0 1")
-            # Use Onshape limits if available, else default ±π
-            lo = str(limits.get("minimum", -3.14159)) if limits else "-3.14159"
-            hi = str(limits.get("maximum",  3.14159)) if limits else "3.14159"
+            lo = str(limits.get("min", -3.14159)) if limits else "-3.14159"
+            hi = str(limits.get("max",  3.14159)) if limits else "3.14159"
             ET.SubElement(joint, "limit",
                           effort="100", velocity="3.14159",
                           lower=lo, upper=hi)
         elif jtype == "prismatic":
             ET.SubElement(joint, "axis", xyz="0 0 1")
-            lo = str(limits.get("minimum", -1.0)) if limits else "-1.0"
-            hi = str(limits.get("maximum",  1.0)) if limits else "1.0"
+            lo = str(limits.get("min", -1.0)) if limits else "-1.0"
+            hi = str(limits.get("max",  1.0)) if limits else "1.0"
             ET.SubElement(joint, "limit",
                           effort="100", velocity="1.0",
                           lower=lo, upper=hi)
@@ -720,6 +797,10 @@ class OnshapeToURDF:
 
     def run(self):
         """Execute the full conversion: fetch → parse → download → URDF."""
+        # Clear output folder so every run starts fresh
+        if self.out.exists():
+            shutil.rmtree(self.out)
+            log.info("Cleared output directory: %s", self.out)
         self.meshes.mkdir(parents=True, exist_ok=True)
 
         # ── Step 1: Fetch assembly definition from Onshape ────────────────
@@ -728,8 +809,14 @@ class OnshapeToURDF:
         debug_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         log.info("Raw API response saved to %s", debug_path)
 
+        # Fetch full assembly features (includes mate limits)
+        features_data = self._fetch_assembly_features()
+        features_debug = self.out / "assembly_features.json"
+        features_debug.write_text(json.dumps(features_data, indent=2), encoding="utf-8")
+        log.info("Assembly features saved to %s", features_debug)
+
         # ── Step 2: Parse into parts and mates ────────────────────────────
-        self._parse(data)
+        self._parse(data, features_data)
         if not self.parts:
             sys.exit("ERROR: No parts found in the assembly.")
 
@@ -786,8 +873,13 @@ class OnshapeToURDF:
 
             # Joint type — revolute mates without limits become continuous
             jtype = MATE_TO_URDF.get(mate["type"], "fixed")
-            if mate["type"] in ("REVOLUTE", "CYLINDRICAL", "PIN_SLOT") and not mate.get("limits"):
-                jtype = "continuous"
+            if mate["type"] in ("REVOLUTE", "CYLINDRICAL", "PIN_SLOT"):
+                if mate.get("limits"):
+                    log.info("  Joint '%s': limits detected from Onshape → %s (limits: %s)",
+                             mate["name"], jtype, mate["limits"])
+                else:
+                    jtype = "continuous"
+                    log.info("  Joint '%s': no limits → continuous", mate["name"])
 
             # Joint origin = transform from parent link frame → child link frame
             joint_T = np.linalg.inv(self.link_frames[parent_id]) @ self.link_frames[child_id]

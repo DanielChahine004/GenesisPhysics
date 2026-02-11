@@ -1,44 +1,71 @@
 <?xml version="1.0" ?>
 <robot name="robot">
+  <link name="part_3_1">
+    <inertial>
+      <origin xyz="0.0017461227 0.01680688 0.13896959" rpy="0 0 0"/>
+      <mass value="0.56836923"/>
+      <inertia ixx="6.5667897e-05" ixy="0" ixz="0" iyy="0.00055839502" iyz="0" izz="0.00055165134"/>
+    </inertial>
+    <visual>
+      <origin xyz="-0.013757133 0.0038184786 0.015845573" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/part_3_1.stl"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="-0.013757133 0.0038184786 0.015845573" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="meshes/part_3_1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="revolute_1" type="revolute">
+    <origin xyz="-0.050753877 0.0043365703 0.12514557" rpy="1.5707963 0 1.5707963"/>
+    <parent link="part_3_1"/>
+    <child link="part_1_1"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="100" velocity="3.14159" lower="4.1887902047863905" upper="6.283185307179586"/>
+  </joint>
   <link name="part_1_1">
     <inertial>
-      <origin xyz="-0.10943506 -0.062110661 0.10878255" rpy="0 0 0"/>
+      <origin xyz="0.01247031 -0.0525 0" rpy="0 0 0"/>
       <mass value="0.56836923"/>
       <inertia ixx="0.00055839502" ixy="0" ixz="0" iyy="6.5667897e-05" iyz="0" izz="0.00055165134"/>
     </inertial>
     <visual>
-      <origin xyz="-0.096446657 -0.11461066 0.086409828" rpy="-1.5707963 1.5707963 0"/>
+      <origin xyz="-0.00051809166 -0.105 0.022372724" rpy="-1.5707963 -1.5707963 0"/>
       <geometry>
         <mesh filename="meshes/part_1_1.stl"/>
       </geometry>
     </visual>
     <collision>
-      <origin xyz="-0.096446657 -0.11461066 0.086409828" rpy="-1.5707963 1.5707963 0"/>
+      <origin xyz="-0.00051809166 -0.105 0.022372724" rpy="-1.5707963 -1.5707963 0"/>
       <geometry>
         <mesh filename="meshes/part_1_1.stl"/>
       </geometry>
     </collision>
   </link>
-  <joint name="revolute_1" type="continuous">
-    <origin xyz="-0.10943506 -0.0096106609 0.10878255" rpy="-1.5707963 1.5707963 0"/>
-    <parent link="part_1_1"/>
+  <joint name="revolute_2" type="revolute">
+    <origin xyz="0.054246123 0.0043365703 0.12514557" rpy="1.5707963 0 1.5707963"/>
+    <parent link="part_3_1"/>
     <child link="part_2_1"/>
     <axis xyz="0 0 1"/>
+    <limit effort="100" velocity="3.14159" lower="4.1887902047863905" upper="6.283185307179586"/>
   </joint>
   <link name="part_2_1">
     <inertial>
-      <origin xyz="1.1926834e-06 9.2599643e-07 0.01895" rpy="0 0 0"/>
-      <mass value="0.57017369"/>
-      <inertia ixx="0.00032279202" ixy="-0.00031237866" ixz="-2.426694e-09" iyy="0.00048135929" iyz="3.1195454e-09" izz="0.00066756353"/>
+      <origin xyz="0.01247031 -0.0525 0" rpy="0 0 0"/>
+      <mass value="0.56836923"/>
+      <inertia ixx="0.00055839502" ixy="0" ixz="0" iyy="6.5667897e-05" iyz="0" izz="0.00055165134"/>
     </inertial>
     <visual>
-      <origin xyz="0.028753962 -0.16351267 0" rpy="1.5707963 0 -2.4804734"/>
+      <origin xyz="-0.00051809166 -0.105 -0.054527276" rpy="-1.5707963 -1.5707963 0"/>
       <geometry>
         <mesh filename="meshes/part_2_1.stl"/>
       </geometry>
     </visual>
     <collision>
-      <origin xyz="0.028753962 -0.16351267 0" rpy="1.5707963 0 -2.4804734"/>
+      <origin xyz="-0.00051809166 -0.105 -0.054527276" rpy="-1.5707963 -1.5707963 0"/>
       <geometry>
         <mesh filename="meshes/part_2_1.stl"/>
       </geometry>

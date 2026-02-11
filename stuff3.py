@@ -10,6 +10,7 @@ plane = scene.add_entity(gs.morphs.Plane())
 robot = scene.add_entity(
     gs.morphs.URDF(
         file=r'C:\Users\h\Desktop\GenesisPhysics\onshape\urdf_output\robot.urdf',
+        pos=(0, 0, 1.0), 
         # fixed=True
     )
 )

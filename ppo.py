@@ -15,10 +15,11 @@ from pathlib import Path
 # ============================================================================
 
 # Simulation parameters
-N_ENVS = 16
-ENV_SPACING = (1.0, 1.0)
+N_ENVS = 1024
+ENV_SPACING = (0.5, 0.5)
 DT = 0.02
-SUBSTEPS = 10
+SUBSTEPS = 4  # Reduced from 10 for speed (test stability)
+SHOW_VIEWER = True
 
 # Robot configuration
 URDF_PATH = r'C:\Users\h\Desktop\GenesisPhysics\onshape\urdf_output\robot.urdf'
@@ -39,22 +40,33 @@ KP_GAIN = 400.0
 KV_GAIN = 20.0
 
 # Training hyperparameters
-HISTORY_LEN = 50
+HISTORY_LEN = 5
 HIDDEN_DIM = 128
 LEARNING_RATE = 3e-4
-ENTROPY_COEFF = 0.02
-GRAD_CLIP_NORM = 1.0
 N_EPOCHS = 2000
 STEPS_PER_EPOCH = 200
 
+# PPO-specific hyperparameters
+GAMMA = 0.99  # Discount factor for returns
+GAE_LAMBDA = 0.95  # Lambda for Generalized Advantage Estimation
+PPO_EPSILON = 0.2  # Clipping parameter for PPO objective
+VALUE_COEFF = 0.5  # Coefficient for value loss
+ENTROPY_COEFF = 0.01  # Coefficient for entropy bonus (reduced for PPO)
+GRAD_CLIP_NORM = 1.0  # Gradient clipping
+N_PPO_EPOCHS = 4  # Number of PPO update epochs per rollout
+MINI_BATCH_SIZE = 2048  # Mini-batch size for PPO updates (N_ENVS * STEPS / k)
+
 # Observation clipping bounds
 VEL_CLIP = 20.0
+ANG_VEL_CLIP = 10.0  # Clip angular velocity to prevent extreme values
 
 # Termination criteria
-HEAD_HEIGHT_THRESHOLD = 0.05
+HEAD_HEIGHT_THRESHOLD = 0.2
 
 # Reward shaping
 HEIGHT_REWARD_SCALE = 2.0  # Multiplier for height reward
+UPRIGHTNESS_REWARD_SCALE = 1.0  # Multiplier for staying upright (low tilt)
+SMOOTHNESS_REWARD_SCALE = 0.5  # Multiplier for smooth joint movements
 TERMINATION_PENALTY = -10.0  # Penalty for falling
 SURVIVAL_BONUS = 0.1  # Small bonus for each timestep alive
 
@@ -93,6 +105,23 @@ class GroupActor(nn.Module):
         return Normal(mu, std)
 
 
+class Critic(nn.Module):
+    """Value function network for PPO."""
+
+    def __init__(self, single_obs_dim, history_len=HISTORY_LEN):
+        super().__init__()
+        self.input_dim = single_obs_dim * history_len
+
+        self.net = nn.Sequential(
+            nn.Linear(self.input_dim, HIDDEN_DIM), nn.ELU(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM), nn.ELU(),
+            nn.Linear(HIDDEN_DIM, 1)
+        )
+
+    def forward(self, obs_history):
+        return self.net(obs_history).squeeze(-1)
+
+
 # ============================================================================
 # GENESIS SCENE INITIALIZATION
 # ============================================================================
@@ -102,10 +131,38 @@ def initialize_scene():
     gs.init(backend=gs.gpu)
 
     sim_options = gs.options.SimOptions(dt=DT, substeps=SUBSTEPS)
-    scene = gs.Scene(sim_options=sim_options, show_viewer=True)
-    scene.add_entity(gs.morphs.Plane())
 
-    robot = scene.add_entity(gs.morphs.URDF(file=URDF_PATH, fixed=False))
+    # Configure viewer for maximum performance
+    if SHOW_VIEWER:
+        viewer_options = gs.options.ViewerOptions(
+            max_FPS=None,          # Cap FPS to reduce rendering overhead
+            camera_pos=(2.0, 0.0, 1.5),
+            camera_lookat=(0.0, 0.0, 0.5),
+            res=(900, 600),     # Lower resolution = faster
+        )
+        vis_options = gs.options.VisOptions(
+            shadow=False,
+            rendered_envs_idx=[1] * min(4, N_ENVS) + [0] * (N_ENVS - min(4, N_ENVS)),
+            )  
+        scene = gs.Scene(
+            sim_options=sim_options,
+            viewer_options=viewer_options,
+            show_viewer=True,
+            vis_options=vis_options,
+        )
+    else:
+        scene = gs.Scene(sim_options=sim_options, show_viewer=False)
+
+    plane = scene.add_entity(gs.morphs.Plane())
+
+    robot = scene.add_entity(
+        gs.morphs.URDF(
+            file=URDF_PATH,
+            fixed=False,
+            collision=True
+        )
+    )
+
     scene.build(n_envs=N_ENVS, env_spacing=ENV_SPACING)
 
     return scene, robot
@@ -185,14 +242,36 @@ def get_head_link_index(robot):
 # OBSERVATION & TERMINATION
 # ============================================================================
 
-def create_observation_function(robot, actuated_indices, head_idx):
+def create_observation_function(robot, actuated_indices, head_idx, action_dim):
     """Create observation collection function with closure over robot state."""
-    def get_single_obs():
-        d_pos = torch.nan_to_num(robot.get_dofs_position()[:, actuated_indices])
-        d_vel = torch.clamp(torch.nan_to_num(robot.get_dofs_velocity()[:, actuated_indices]), -VEL_CLIP, VEL_CLIP)
-        b_vel = torch.clamp(torch.nan_to_num(robot.get_links_vel()[:, 0, :3]), -VEL_CLIP, VEL_CLIP)
+    def get_single_obs(previous_actions=None):
+        # All joint positions and velocities (not just actuated)
+        all_dof_pos = torch.nan_to_num(robot.get_dofs_position())
+        all_dof_vel = torch.clamp(torch.nan_to_num(robot.get_dofs_velocity()), -VEL_CLIP, VEL_CLIP)
+
+        # Base orientation (quaternion: w, x, y, z)
+        base_quat = torch.nan_to_num(robot.get_quat())
+
+        # Base linear and angular velocity
+        base_lin_vel = torch.clamp(torch.nan_to_num(robot.get_vel()), -VEL_CLIP, VEL_CLIP)
+        base_ang_vel = torch.clamp(torch.nan_to_num(robot.get_ang()), -ANG_VEL_CLIP, ANG_VEL_CLIP)
+
+        # Head position
         head_pos = torch.nan_to_num(robot.get_links_pos()[:, head_idx, :])
-        return torch.cat([d_pos, d_vel, b_vel, head_pos], dim=-1)
+
+        # Previous actions (zero if not provided)
+        if previous_actions is None:
+            previous_actions = torch.zeros((robot.get_pos().shape[0], action_dim), device=gs.device)
+
+        return torch.cat([
+            all_dof_pos,
+            all_dof_vel,
+            base_quat,
+            base_lin_vel,
+            base_ang_vel,
+            head_pos,
+            previous_actions
+        ], dim=-1)
 
     return get_single_obs
 
@@ -209,30 +288,79 @@ def create_termination_check(robot, head_idx):
 def create_history_reset(get_single_obs):
     """Create history buffer reset function."""
     def reset_history(envs_idx=None):
-        init_obs = get_single_obs().repeat(1, HISTORY_LEN)
+        # Use zero previous actions for reset
+        init_obs = get_single_obs(previous_actions=None).repeat(1, HISTORY_LEN)
         return init_obs if envs_idx is None else init_obs[envs_idx]
 
     return reset_history
 
 
-def create_reward_function(robot, head_idx):
-    """Create reward computation function that encourages height."""
+def quaternion_to_uprightness(quat):
+    """
+    Compute uprightness metric from quaternion.
+    Returns value in [0, 1] where 1 = perfectly upright, 0 = upside down.
+
+    Args:
+        quat: (N, 4) quaternion in [w, x, y, z] format
+    """
+    # Extract quaternion components
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+
+    # Compute the Z-component of the robot's up vector in world frame
+    # This is the (2,2) element of the rotation matrix
+    # R[2,2] = 1 - 2(x^2 + y^2)
+    z_up = 1.0 - 2.0 * (x**2 + y**2)
+
+    # z_up ranges from -1 (upside down) to 1 (upright)
+    # Map to [0, 1] range
+    uprightness = (z_up + 1.0) / 2.0
+
+    return uprightness
+
+
+def create_reward_function(robot, head_idx, actuated_indices):
+    """Create reward computation function that encourages height, uprightness, and smoothness."""
+    # Track previous joint positions for smoothness reward
+    prev_joint_pos = None
+
     def compute_reward(terminated):
+        nonlocal prev_joint_pos
+
         head_height = robot.get_links_pos()[:, head_idx, 2]
 
-        # Height-based reward (higher = better)
+        # 1. Height-based reward (higher = better)
         height_reward = HEIGHT_REWARD_SCALE * head_height
 
-        # Survival bonus for staying alive
+        # 2. Uprightness reward (minimize tilt)
+        base_quat = robot.get_quat()
+        uprightness = quaternion_to_uprightness(base_quat)
+        uprightness_reward = UPRIGHTNESS_REWARD_SCALE * uprightness
+
+        # 3. Smoothness reward (penalize rapid joint movements)
+        current_joint_pos = robot.get_dofs_position()[:, actuated_indices]
+
+        if prev_joint_pos is not None:
+            # Compute L2 norm of joint position changes
+            joint_delta = current_joint_pos - prev_joint_pos
+            joint_velocity_penalty = torch.mean(joint_delta**2, dim=-1)
+            smoothness_reward = -SMOOTHNESS_REWARD_SCALE * joint_velocity_penalty
+        else:
+            smoothness_reward = torch.zeros(current_joint_pos.shape[0], device=gs.device)
+
+        # Update previous joint positions (detach to avoid unnecessary grad tracking)
+        prev_joint_pos = current_joint_pos.detach()
+
+        # 4. Survival bonus
         survival_reward = SURVIVAL_BONUS
 
-        # Combine rewards
-        reward = height_reward + survival_reward
+        # Combine all rewards
+        reward = height_reward + uprightness_reward + smoothness_reward + survival_reward
 
         # Apply termination penalty
         reward = torch.where(terminated, torch.tensor(TERMINATION_PENALTY, device=gs.device), reward)
 
-        return reward
+        # Return reward and metrics to avoid recomputing
+        return reward, head_height, uprightness
 
     return compute_reward
 
@@ -252,7 +380,6 @@ def reset_environments(robot, envs_to_reset, home_pos, home_quat, j_init, actuat
     robot.set_dofs_position(j_init.repeat(len(envs_to_reset), 1), actuated_indices, envs_idx=envs_to_reset)
 
     fresh_hists = reset_history(envs_to_reset)
-    obs_history = obs_history.clone()
     obs_history[envs_to_reset] = fresh_hists
 
     return obs_history
@@ -351,13 +478,24 @@ def print_model_diagnostics(robot, head_idx, target_names, actuated_indices, j_l
 
     # Reward configuration
     print(f"\n[REWARD SHAPING]")
-    print(f"  - Height Reward Scale:  {HEIGHT_REWARD_SCALE}")
-    print(f"  - Survival Bonus:       {SURVIVAL_BONUS}")
-    print(f"  - Termination Penalty:  {TERMINATION_PENALTY}")
-    print(f"  - Head Height Threshold: {HEAD_HEIGHT_THRESHOLD} m")
+    print(f"  - Height Reward Scale:      {HEIGHT_REWARD_SCALE}")
+    print(f"  - Uprightness Reward Scale: {UPRIGHTNESS_REWARD_SCALE}")
+    print(f"  - Smoothness Reward Scale:  {SMOOTHNESS_REWARD_SCALE}")
+    print(f"  - Survival Bonus:           {SURVIVAL_BONUS}")
+    print(f"  - Termination Penalty:      {TERMINATION_PENALTY}")
+    print(f"  - Head Height Threshold:    {HEAD_HEIGHT_THRESHOLD} m")
 
     # Neural network
     print(f"\n[POLICY NETWORK]")
+    print(f"  - Single Observation Breakdown:")
+    print(f"    • All DOF Positions: {robot.n_dofs}")
+    print(f"    • All DOF Velocities: {robot.n_dofs}")
+    print(f"    • Base Orientation (Quat WXYZ): 4")
+    print(f"    • Base Linear Velocity (XYZ): 3")
+    print(f"    • Base Angular Velocity (XYZ): 3")
+    print(f"    • Head Position (XYZ): 3")
+    print(f"    • Previous Actions: {action_dim}")
+    print(f"    • Total Single Obs Dim: {single_obs_dim}")
     print(f"  - Input Dimension:  {actor.input_dim}")
     print(f"    (History: {HISTORY_LEN} steps x Single Obs: {single_obs_dim})")
     print(f"  - Output Dimension: {action_dim}")
@@ -386,20 +524,84 @@ def print_model_diagnostics(robot, head_idx, target_names, actuated_indices, j_l
 # TRAINING UTILITIES
 # ============================================================================
 
-def compute_policy_loss(log_probs, rewards, entropies):
-    """Compute REINFORCE loss with baseline and entropy regularization."""
-    log_probs = torch.stack(log_probs)
-    rewards = torch.stack(rewards)
-    entropies = torch.stack(entropies)
+def compute_gae(rewards, values, dones, gamma=GAMMA, lam=GAE_LAMBDA):
+    """
+    Compute Generalized Advantage Estimation.
 
-    baseline = rewards.mean(dim=1, keepdim=True)
-    advantage = (rewards - baseline) / (rewards.std() + 1e-6)
-    loss = -(log_probs * advantage.detach()).mean() - (ENTROPY_COEFF * entropies).mean()
+    Args:
+        rewards: (T, N) tensor of rewards
+        values: (T+1, N) tensor of value estimates
+        dones: (T, N) tensor of done flags
+        gamma: discount factor
+        lam: GAE lambda parameter
 
-    return loss
+    Returns:
+        advantages: (T, N) tensor of advantages
+        returns: (T, N) tensor of discounted returns
+    """
+    T, N = rewards.shape
+    advantages = torch.zeros_like(rewards)
+    gae = torch.zeros(N, device=rewards.device)
+
+    # Compute GAE backwards through time
+    for t in reversed(range(T)):
+        delta = rewards[t] + gamma * values[t + 1] * (1 - dones[t]) - values[t]
+        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        advantages[t] = gae
+
+    # Returns = advantages + values
+    returns = advantages + values[:-1]
+
+    return advantages, returns
 
 
-def step_simulation(robot, scene, actor, obs_history, j_low, j_high, actuated_indices, get_single_obs, single_obs_dim):
+def compute_ppo_loss(actor, critic, obs_history, actions, old_log_probs, advantages, returns):
+    """
+    Compute PPO clipped surrogate loss.
+
+    Args:
+        actor: Policy network
+        critic: Value network
+        obs_history: Observation history
+        actions: Actions taken
+        old_log_probs: Log probabilities from old policy
+        advantages: GAE advantages
+        returns: Discounted returns
+
+    Returns:
+        total_loss: Combined actor + critic loss
+        policy_loss: Actor loss component
+        value_loss: Critic loss component
+        entropy: Policy entropy
+    """
+    # Compute current policy distribution
+    dist = actor(obs_history)
+    log_probs = dist.log_prob(actions).sum(dim=-1)
+    entropy = dist.entropy().sum(dim=-1).mean()
+
+    # Compute value predictions
+    values = critic(obs_history)
+
+    # PPO clipped surrogate objective
+    ratio = torch.exp(log_probs - old_log_probs)
+    clipped_ratio = torch.clamp(ratio, 1 - PPO_EPSILON, 1 + PPO_EPSILON)
+
+    advantages_normalized = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    policy_loss = -torch.min(
+        ratio * advantages_normalized,
+        clipped_ratio * advantages_normalized
+    ).mean()
+
+    # Value loss (MSE)
+    value_loss = 0.5 * ((values - returns) ** 2).mean()
+
+    # Total loss
+    total_loss = policy_loss + VALUE_COEFF * value_loss - ENTROPY_COEFF * entropy
+
+    return total_loss, policy_loss, value_loss, entropy
+
+
+def step_simulation(robot, scene, actor, obs_history, j_low, j_high, actuated_indices, get_single_obs, single_obs_dim, previous_actions):
     """Execute one simulation step: action selection, physics, observation update."""
     # Action selection
     dist = actor(obs_history)
@@ -407,16 +609,16 @@ def step_simulation(robot, scene, actor, obs_history, j_low, j_high, actuated_in
     log_prob = dist.log_prob(actions).sum(dim=-1)
     entropy = dist.entropy().sum(dim=-1)
 
-    # Apply actions
+    # Apply actions (map from [-1,1] to [j_low, j_high])
     target_pos = j_low + (torch.tanh(actions) + 1.0) * 0.5 * (j_high - j_low)
     robot.control_dofs_position(target_pos, actuated_indices)
     scene.step()
 
-    # Update observation history
-    new_obs = get_single_obs()
+    # Update observation history (include previous actions)
+    new_obs = get_single_obs(previous_actions=actions)
     obs_history = torch.cat([obs_history[:, single_obs_dim:], new_obs], dim=-1)
 
-    return obs_history, log_prob, entropy
+    return obs_history, log_prob, entropy, actions
 
 
 # ============================================================================
@@ -440,19 +642,25 @@ def main():
     # Get head link index
     head_idx = get_head_link_index(robot)
 
-    # Create helper functions
-    get_single_obs = create_observation_function(robot, actuated_indices, head_idx)
-    check_termination = create_termination_check(robot, head_idx)
-    reset_history = create_history_reset(get_single_obs)
-    compute_reward = create_reward_function(robot, head_idx)
-
-    # Setup policy network
-    sample_obs = get_single_obs()
-    single_obs_dim = sample_obs.shape[-1]
+    # Determine action dimension
     action_dim = len(actuated_indices)
 
+    # Create helper functions
+    get_single_obs = create_observation_function(robot, actuated_indices, head_idx, action_dim)
+    check_termination = create_termination_check(robot, head_idx)
+    reset_history = create_history_reset(get_single_obs)
+    compute_reward = create_reward_function(robot, head_idx, actuated_indices)
+
+    # Setup policy and value networks
+    sample_obs = get_single_obs()
+    single_obs_dim = sample_obs.shape[-1]
+
     actor = GroupActor(single_obs_dim, action_dim, HISTORY_LEN).to(gs.device)
-    optimizer = optim.Adam(actor.parameters(), lr=LEARNING_RATE)
+    critic = Critic(single_obs_dim, HISTORY_LEN).to(gs.device)
+
+    # Separate optimizers for actor and critic
+    actor_optimizer = optim.Adam(actor.parameters(), lr=LEARNING_RATE)
+    critic_optimizer = optim.Adam(critic.parameters(), lr=LEARNING_RATE)
 
     # Print diagnostics and get user confirmation
     use_tensorboard = print_model_diagnostics(robot, head_idx, target_names, actuated_indices,
@@ -465,54 +673,148 @@ def main():
 
     # Training loop
     for epoch in range(N_EPOCHS):
-        log_probs, rewards, entropies = [], [], []
-        head_heights = []  # Track head heights for TensorBoard
+        # Storage for rollout data
+        all_obs_history = []
+        all_actions = []
+        all_log_probs = []
+        all_rewards = []
+        all_values = []
+        all_dones = []
+        head_heights = []
+        uprightness_values = []
 
         # Global reset
         obs_history = global_reset(robot, home_pos, home_quat, j_init, actuated_indices, reset_history)
+        previous_actions = torch.zeros((N_ENVS, action_dim), device=gs.device)
 
-        # Rollout
-        for _ in range(STEPS_PER_EPOCH):
-            # Step simulation
-            obs_history, log_prob, entropy = step_simulation(
-                robot, scene, actor, obs_history, j_low, j_high, actuated_indices,
-                get_single_obs, single_obs_dim
-            )
+        # Rollout collection
+        for step in range(STEPS_PER_EPOCH):
+            # Store current observation (no clone needed - we'll detach later)
+            all_obs_history.append(obs_history)
 
-            # Check termination and reset failed environments
+            # Get action and value
+            with torch.no_grad():
+                dist = actor(obs_history)
+                actions = dist.rsample()
+                log_probs = dist.log_prob(actions).sum(dim=-1)
+                values = critic(obs_history)
+
+            # Apply actions
+            target_pos = j_low + (torch.tanh(actions) + 1.0) * 0.5 * (j_high - j_low)
+            robot.control_dofs_position(target_pos, actuated_indices)
+            scene.step()
+
+            # Get new observation
+            new_obs = get_single_obs(previous_actions=actions)
+            obs_history = torch.cat([obs_history[:, single_obs_dim:], new_obs], dim=-1)
+
+            # Check termination
             terminated = check_termination()
+            dones = terminated.float()
+
+            # Reset terminated environments
             envs_to_reset = torch.where(terminated)[0]
-            obs_history = reset_environments(
-                robot, envs_to_reset, home_pos, home_quat, j_init,
-                actuated_indices, obs_history, reset_history
-            )
+            if len(envs_to_reset) > 0:
+                obs_history = reset_environments(
+                    robot, envs_to_reset, home_pos, home_quat, j_init,
+                    actuated_indices, obs_history, reset_history
+                )
+                actions[envs_to_reset] = 0.0
 
-            # Track metrics
-            reward = compute_reward(terminated)
-            head_height = robot.get_links_pos()[:, head_idx, 2]
+            # Compute rewards (also returns metrics to avoid recomputation)
+            rewards, head_height, uprightness = compute_reward(terminated)
 
-            log_probs.append(log_prob)
-            rewards.append(reward)
-            entropies.append(entropy)
+            # Store rollout data
+            all_actions.append(actions)
+            all_log_probs.append(log_probs)
+            all_rewards.append(rewards)
+            all_values.append(values)
+            all_dones.append(dones)
             head_heights.append(head_height)
+            uprightness_values.append(uprightness)
 
-        # Update policy
-        loss = compute_policy_loss(log_probs, rewards, entropies)
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP_NORM)
-        optimizer.step()
+            # Update previous actions
+            previous_actions = actions
+
+        # Get final value for bootstrapping
+        with torch.no_grad():
+            final_value = critic(obs_history)
+            all_values.append(final_value)
+
+        # Convert to tensors
+        obs_tensor = torch.stack(all_obs_history)  # (T, N, obs_dim)
+        actions_tensor = torch.stack(all_actions)  # (T, N, action_dim)
+        old_log_probs_tensor = torch.stack(all_log_probs)  # (T, N)
+        rewards_tensor = torch.stack(all_rewards)  # (T, N)
+        values_tensor = torch.stack(all_values)  # (T+1, N)
+        dones_tensor = torch.stack(all_dones)  # (T, N)
+
+        # Compute GAE
+        advantages, returns = compute_gae(rewards_tensor, values_tensor, dones_tensor)
+
+        # Flatten for mini-batch training
+        T, N = rewards_tensor.shape
+        obs_flat = obs_tensor.reshape(T * N, -1)
+        actions_flat = actions_tensor.reshape(T * N, -1)
+        old_log_probs_flat = old_log_probs_tensor.reshape(T * N)
+        advantages_flat = advantages.reshape(T * N)
+        returns_flat = returns.reshape(T * N)
+
+        # PPO update epochs
+        total_policy_loss = 0
+        total_value_loss = 0
+        total_entropy = 0
+        n_updates = 0
+
+        for ppo_epoch in range(N_PPO_EPOCHS):
+            # Create random mini-batches
+            indices = torch.randperm(T * N, device=gs.device)
+
+            for start_idx in range(0, T * N, MINI_BATCH_SIZE):
+                end_idx = min(start_idx + MINI_BATCH_SIZE, T * N)
+                batch_indices = indices[start_idx:end_idx]
+
+                # Get mini-batch
+                obs_batch = obs_flat[batch_indices]
+                actions_batch = actions_flat[batch_indices]
+                old_log_probs_batch = old_log_probs_flat[batch_indices]
+                advantages_batch = advantages_flat[batch_indices]
+                returns_batch = returns_flat[batch_indices]
+
+                # Compute PPO loss
+                loss, policy_loss, value_loss, entropy = compute_ppo_loss(
+                    actor, critic, obs_batch, actions_batch,
+                    old_log_probs_batch, advantages_batch, returns_batch
+                )
+
+                # Update networks
+                actor_optimizer.zero_grad()
+                critic_optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), GRAD_CLIP_NORM)
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), GRAD_CLIP_NORM)
+                actor_optimizer.step()
+                critic_optimizer.step()
+
+                # Track losses
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
+                n_updates += 1
 
         # Logging
         if epoch % 2 == 0:
-            rewards_tensor = torch.stack(rewards)
             avg_reward = rewards_tensor.mean().item()
             total_reward = rewards_tensor.sum(dim=0).mean().item()
+            avg_policy_loss = total_policy_loss / n_updates
+            avg_value_loss = total_value_loss / n_updates
+            avg_entropy = total_entropy / n_updates
 
             # Count survival steps (non-terminated steps)
             survival_steps = (rewards_tensor > TERMINATION_PENALTY).sum(dim=0).float().mean().item()
 
-            print(f"Epoch {epoch} | Avg Reward: {avg_reward:+.3f} | Total Reward: {total_reward:+.1f} | Avg Survival: {survival_steps:.1f} steps")
+            print(f"Epoch {epoch} | Reward: {avg_reward:+.3f} | Total: {total_reward:+.1f} | Survival: {survival_steps:.1f} | "
+                  f"PL: {avg_policy_loss:.3f} | VL: {avg_value_loss:.3f}")
 
             # TensorBoard logging
             if writer is not None:
@@ -520,7 +822,13 @@ def main():
                 writer.add_scalar('Training/AvgReward', avg_reward, epoch)
                 writer.add_scalar('Training/TotalReward', total_reward, epoch)
                 writer.add_scalar('Training/SurvivalSteps', survival_steps, epoch)
-                writer.add_scalar('Training/Loss', loss.item(), epoch)
+                writer.add_scalar('Training/PolicyLoss', avg_policy_loss, epoch)
+                writer.add_scalar('Training/ValueLoss', avg_value_loss, epoch)
+                writer.add_scalar('Training/Entropy', avg_entropy, epoch)
+
+                # Advantage statistics
+                writer.add_scalar('Training/AdvantagesMean', advantages.mean().item(), epoch)
+                writer.add_scalar('Training/AdvantagesStd', advantages.std().item(), epoch)
 
                 # Head height statistics
                 heights_tensor = torch.stack(head_heights)
@@ -529,9 +837,13 @@ def main():
                 writer.add_scalar('Robot/AvgHeadHeight', avg_head_height, epoch)
                 writer.add_scalar('Robot/MaxHeadHeight', max_head_height, epoch)
 
+                # Uprightness statistics
+                uprightness_tensor = torch.stack(uprightness_values)
+                avg_uprightness = uprightness_tensor.mean().item()
+                writer.add_scalar('Robot/AvgUprightness', avg_uprightness, epoch)
+
                 # Policy statistics
                 writer.add_scalar('Policy/LogStdMean', actor.log_std.mean().item(), epoch)
-                writer.add_scalar('Policy/EntropyMean', torch.stack(entropies).mean().item(), epoch)
 
     # Cleanup TensorBoard
     if writer is not None:

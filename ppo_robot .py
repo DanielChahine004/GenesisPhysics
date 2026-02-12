@@ -16,7 +16,7 @@ from pathlib import Path
 
 # Simulation parameters
 N_ENVS = 1024
-ENV_SPACING = (0.5, 0.5)
+ENV_SPACING = (0.0, 0.0) # (0.5, 0.5)
 DT = 0.02
 SUBSTEPS = 4  # Reduced from 10 for speed (test stability)
 SHOW_VIEWER = True
@@ -54,7 +54,7 @@ VALUE_COEFF = 0.5  # Coefficient for value loss
 ENTROPY_COEFF = 0.01  # Coefficient for entropy bonus (reduced for PPO)
 GRAD_CLIP_NORM = 1.0  # Gradient clipping
 N_PPO_EPOCHS = 4  # Number of PPO update epochs per rollout
-MINI_BATCH_SIZE = 2048  # Mini-batch size for PPO updates (N_ENVS * STEPS / k)
+MINI_BATCH_SIZE = 8192  # Mini-batch size for PPO updates (N_ENVS * STEPS / k)
 
 # Observation clipping bounds
 VEL_CLIP = 20.0
@@ -65,8 +65,8 @@ HEAD_HEIGHT_THRESHOLD = 0.2
 
 # Reward shaping
 HEIGHT_REWARD_SCALE = 2.0  # Multiplier for height reward
-UPRIGHTNESS_REWARD_SCALE = 1.0  # Multiplier for staying upright (low tilt)
-SMOOTHNESS_REWARD_SCALE = 0.5  # Multiplier for smooth joint movements
+UPRIGHTNESS_REWARD_SCALE = 3.0  # Multiplier for staying upright (low tilt)
+SMOOTHNESS_REWARD_SCALE = 1  # Multiplier for smooth joint movements
 TERMINATION_PENALTY = -10.0  # Penalty for falling
 SURVIVAL_BONUS = 0.1  # Small bonus for each timestep alive
 
@@ -128,7 +128,7 @@ class Critic(nn.Module):
 
 def initialize_scene():
     """Initialize Genesis simulation with robot and plane."""
-    gs.init(backend=gs.gpu)
+    gs.init(backend=gs.gpu, performance_mode=True)
 
     sim_options = gs.options.SimOptions(dt=DT, substeps=SUBSTEPS)
 
